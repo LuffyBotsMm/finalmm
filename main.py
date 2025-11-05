@@ -1,216 +1,212 @@
 #!/usr/bin/env python3
-"""
-FinalMM Pro Edition — LB Escrow Bot
-Fully automatic, 24×7, styled Telegram escrow manager
-"""
+# FinalMM v3.1 – 24x7 Escrow Bot | Developed for Aarohi by Ashra
 
 import os, time, random, sqlite3, logging, threading, requests
-from functools import wraps
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-from apscheduler.schedulers.background import BackgroundScheduler
 
-# ───── CONFIG ─────
+# ===== CONFIG =====
 BOT_TOKEN = "8273619720:AAEbCOxf1Ycx4OTFS8ZzFbJimw1tba0V8Y0"
 OWNER_ID = 6847499628
 LOG_CHANNEL = -1003089374759
 PW_BY = "@LuffyBots"
 DB_FILE = "finalmm.db"
-# ─────────────────
+KEEP_ALIVE_URL = "https://choreo.dev"  # for uptime ping (optional)
 
+# ===== LOGGING =====
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ───── DATABASE ─────
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS deals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        trade_id TEXT UNIQUE,
-        buyer TEXT,
-        seller TEXT,
-        amount REAL,
-        escrower TEXT,
-        status TEXT,
-        created_at INTEGER,
-        closed_at INTEGER DEFAULT 0
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS admins (
-        user_id INTEGER PRIMARY KEY
-    )""")
-    cur.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
-    conn.commit()
-    conn.close()
+# ===== DATABASE =====
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+cur = conn.cursor()
+cur.execute("""CREATE TABLE IF NOT EXISTS deals (
+ trade_id TEXT PRIMARY KEY,
+ chat_id INTEGER,
+ amount REAL,
+ buyer TEXT,
+ seller TEXT,
+ escrower TEXT,
+ status TEXT,
+ created_at INTEGER,
+ closed_at INTEGER
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)""")
+conn.commit()
 
-def db_exec(q, p=(), fetch=False):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(q, p)
-    data = cur.fetchall() if fetch else None
-    conn.commit()
-    conn.close()
-    return data
-
-init_db()
-
-# ───── UTILITIES ─────
-def is_admin(uid): 
+# ===== UTILS =====
+def gen_tid(): return "TID" + str(random.randint(100000, 999999))
+def now(): return int(time.time())
+def is_owner(uid): return uid == OWNER_ID
+def is_admin(uid):
     if uid == OWNER_ID: return True
-    return bool(db_exec("SELECT 1 FROM admins WHERE user_id=?", (uid,), fetch=True))
+    cur.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,))
+    return bool(cur.fetchone())
 
-def admin_only(func):
-    @wraps(func)
-    def wrap(update, context, *a, **kw):
-        if not update.effective_user: return
-        if not is_admin(update.effective_user.id):
-            update.message.reply_text("⚠️ Only Admins can use this command.")
-            return
-        return func(update, context, *a, **kw)
-    return wrap
+def fmt(header, amt, buyer, seller, esc, tid, status):
+    msg = (
+        f"{header}\n\n"
+        f"💰 Amount: ₹{amt}\n"
+        f"🤝 Buyer: {buyer}\n"
+        f"🏷️ Seller: {seller}\n"
+        f"🧾 Trade ID: #{tid}\n"
+        f"👑 Escrowed By: {esc}\n\n"
+        f"🧭 PW BY: {PW_BY}\n"
+    )
+    if status == "OPEN": msg += "\n✅ Payment Received\nContinue your deal safely 🔥"
+    elif status == "CLOSED": msg += "\n🎯 Deal Completed Successfully!"
+    elif status == "REFUNDED": msg += "\n💸 Funds Returned to Buyer"
+    elif status == "CANCELLED": msg += "\n❌ Deal Cancelled"
+    return msg
 
-def owner_only(func):
-    @wraps(func)
-    def wrap(update, context, *a, **kw):
-        if not update.effective_user: return
-        if update.effective_user.id != OWNER_ID:
-            update.message.reply_text("❌ Only Owner can use this command.")
-            return
-        return func(update, context, *a, **kw)
-    return wrap
+# ===== CORE COMMANDS =====
+def start(update, ctx):
+    update.message.reply_text("🤖 LBMM Escrow Bot is active 24×7.\nUse /command to view all admin commands.")
 
-def trade_id(): return f"TID{random.randint(100000,999999)}"
+def id_cmd(update, ctx): update.message.reply_text(f"🪪 Your ID: {update.effective_user.id}")
 
-def send_log(context, text):
-    try: context.bot.send_message(LOG_CHANNEL, text, parse_mode=ParseMode.HTML)
-    except: pass
-
-# ───── COMMANDS ─────
-def start(update, context):
-    update.message.reply_text(
-        "✨ <b>LB FinalMM Escrow Bot</b> is live!\n\n"
-        "Use /add <amount> <@buyer> <@seller> to create a deal.\n"
-        "Use /close <tid> or /close <amount> <@buyer> <@seller> to close.\n\n"
-        "For help: /adminlist /status /stats /mydeals /topuser",
-        parse_mode=ParseMode.HTML)
-
-@admin_only
-def add(update, context):
-    args = context.args
-    if len(args) < 3:
-        update.message.reply_text("Usage: /add <amount> <@buyer> <@seller>")
+def add(update, ctx):
+    m = update.message
+    if not m.reply_to_message or len(ctx.args) < 1:
+        m.reply_text("Reply to seller and use: /add <amount>")
         return
-    amount, buyer, seller = args[0], args[1], args[2]
-    tid = trade_id()
-    escrower = "@" + (update.effective_user.username or str(update.effective_user.id))
-    db_exec("INSERT INTO deals (trade_id,buyer,seller,amount,escrower,status,created_at) VALUES (?,?,?,?,?,?,?)",
-        (tid, buyer, seller, amount, escrower, "OPEN", int(time.time())))
-    msg = (f"💼 <b>𝗡𝗘𝗪 𝗗𝗘𝗔𝗟 𝗖𝗥𝗘𝗔𝗧𝗘𝗗</b>\n\n"
-           f"💰 <b>Amount:</b> ₹{amount}\n🤝 <b>Buyer:</b> {buyer}\n🏷️ <b>Seller:</b> {seller}\n"
-           f"🧾 <b>Trade ID:</b> #{tid}\n👑 <b>Escrowed By:</b> {escrower}\n\n"
-           f"✅ Payment Received\nContinue your deal safely 🔥\n\n🧭 <b>PW BY:</b> {PW_BY}")
-    update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-    send_log(context, f"🆕 Deal Created {tid} • {amount} by {escrower}")
+    try: amt = float(ctx.args[0])
+    except: m.reply_text("Invalid amount"); return
+    buyer = f"@{m.from_user.username}" if m.from_user.username else m.from_user.first_name
+    seller = f"@{m.reply_to_message.from_user.username}" if m.reply_to_message.from_user.username else m.reply_to_message.from_user.first_name
+    esc = buyer
+    tid = gen_tid()
+    msg = fmt("💼 𝗡𝗘𝗪 𝗗𝗘𝗔𝗟 𝗖𝗥𝗘𝗔𝗧𝗘𝗗", amt, buyer, seller, esc, tid, "OPEN")
+    m.reply_text(msg, parse_mode=ParseMode.HTML)
+    cur.execute("INSERT INTO deals VALUES (?,?,?,?,?,?,?,?,?)", (tid, m.chat_id, amt, buyer, seller, esc, "OPEN", now(), 0)); conn.commit()
+    ctx.bot.send_message(LOG_CHANNEL, f"🧾 New Deal Created #{tid} | ₹{amt}")
 
-@admin_only
-def close(update, context):
-    args = context.args
-    if not args:
-        update.message.reply_text("Usage: /close <TID> or /close <amount> <@buyer> <@seller>")
-        return
-    tid = args[0].upper()
-    row = db_exec("SELECT * FROM deals WHERE trade_id=?", (tid,), fetch=True)
-    if not row:
-        update.message.reply_text("❌ Trade not found.")
-        return
-    db_exec("UPDATE deals SET status=?, closed_at=? WHERE trade_id=?", ("CLOSED", int(time.time()), tid))
-    deal = row[0]
-    msg = (f"🔒 <b>𝗗𝗘𝗔𝗟 𝗖𝗟𝗢𝗦𝗘𝗗</b> ✅\n\n"
-           f"💰 ₹{deal[4]}\n🧾 #{deal[1]}\n🤝 {deal[2]} → {deal[3]}\n"
-           f"👑 Escrowed By: {deal[5]}\n\n✅ Transaction Completed Securely\n🧭 <b>PW BY:</b> {PW_BY}")
-    update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-    send_log(context, f"✅ Deal Closed {tid}")
+def _update_status(update, ctx, new_status, header):
+    m = update.message
+    if len(ctx.args) < 1: m.reply_text(f"Usage: /{new_status.lower()} <amount>"); return
+    amt = float(ctx.args[0])
+    cur.execute("SELECT trade_id,buyer,seller,escrower FROM deals WHERE amount=? AND status='OPEN'", (amt,))
+    r = cur.fetchone()
+    if not r: m.reply_text("No open deal found"); return
+    tid, b, s, e = r
+    msg = fmt(header, amt, b, s, e, tid, new_status)
+    m.reply_text(msg, parse_mode=ParseMode.HTML)
+    cur.execute("UPDATE deals SET status=?, closed_at=? WHERE trade_id=?", (new_status, now(), tid)); conn.commit()
+    ctx.bot.send_message(LOG_CHANNEL, f"🔄 {new_status} #{tid}")
 
-def history(update, context):
-    rows = db_exec("SELECT trade_id,amount,buyer,seller,status FROM deals ORDER BY id DESC LIMIT 10", fetch=True)
-    if not rows:
-        update.message.reply_text("No recent deals.")
-        return
-    text = "🕒 <b>Recent Deals</b>\n\n" + "\n".join([f"#{r[0]} • ₹{r[1]} • {r[4]}" for r in rows])
-    update.message.reply_text(text, parse_mode=ParseMode.HTML)
+def close(update, ctx): _update_status(update, ctx, "CLOSED", "✅ 𝗗𝗘𝗔𝗟 𝗖𝗟𝗢𝗦𝗘𝗗")
+def refund(update, ctx): _update_status(update, ctx, "REFUNDED", "💸 𝗗𝗘𝗔𝗟 𝗥𝗘𝗙𝗨𝗡𝗗𝗘𝗗")
+def cancel(update, ctx): _update_status(update, ctx, "CANCELLED", "❌ 𝗗𝗘𝗔𝗟 𝗖𝗔𝗡𝗖𝗘𝗟𝗟𝗘𝗗")
 
-@owner_only
-def broadcast(update, context):
-    if not context.args:
-        update.message.reply_text("Usage: /broadcast <message>")
-        return
-    msg = " ".join(context.args)
-    rows = db_exec("SELECT DISTINCT buyer FROM deals", fetch=True)
-    for r in rows:
-        try: context.bot.send_message(r[0], msg)
+def status(update, ctx):
+    if not ctx.args: update.message.reply_text("Usage: /status <TradeID>"); return
+    tid = ctx.args[0].upper().replace("#", "")
+    cur.execute("SELECT amount,buyer,seller,status,created_at,closed_at FROM deals WHERE trade_id=?", (tid,))
+    r = cur.fetchone()
+    if not r: update.message.reply_text("Trade not found."); return
+    amt,b,s,st,c,x = r
+    update.message.reply_text(f"📊 #{tid}\n💰 ₹{amt}\n🤝 {b}\n🏷️ {s}\n📌 Status: {st}\n🕒 {time.ctime(c)}")
+
+def history(update, ctx):
+    cur.execute("SELECT trade_id,status,amount FROM deals ORDER BY created_at DESC LIMIT 10")
+    rows = cur.fetchall()
+    if not rows: update.message.reply_text("No deals yet."); return
+    text = "\n".join([f"#{r[0]} | ₹{r[2]} | {r[1]}" for r in rows])
+    update.message.reply_text("🕓 **Recent Deals:**\n" + text, parse_mode=ParseMode.MARKDOWN)
+
+def ongoing(update, ctx):
+    cur.execute("SELECT trade_id,amount,buyer,seller FROM deals WHERE status='OPEN'")
+    rows = cur.fetchall()
+    if not rows: update.message.reply_text("No ongoing deals."); return
+    text = "\n".join([f"#{r[0]} | ₹{r[1]} | {r[2]} ➜ {r[3]}" for r in rows])
+    update.message.reply_text("🔥 **Ongoing Deals:**\n" + text, parse_mode=ParseMode.MARKDOWN)
+
+def broadcast(update, ctx):
+    if not is_admin(update.effective_user.id): return
+    text = " ".join(ctx.args)
+    if not text: update.message.reply_text("Usage: /broadcast <message>"); return
+    cur.execute("SELECT DISTINCT buyer FROM deals")
+    users = cur.fetchall()
+    sent = 0
+    for u in users:
+        try:
+            ctx.bot.send_message(u[0], text)
+            sent += 1
         except: pass
-    update.message.reply_text("✅ Broadcast sent.")
+    update.message.reply_text(f"📢 Broadcast sent to {sent} users.")
 
-def stats(update, context):
-    total = db_exec("SELECT COUNT(*), SUM(amount) FROM deals", fetch=True)[0]
-    open_d = db_exec("SELECT COUNT(*) FROM deals WHERE status='OPEN'", fetch=True)[0][0]
-    closed_d = db_exec("SELECT COUNT(*) FROM deals WHERE status='CLOSED'", fetch=True)[0][0]
-    text = (f"📊 <b>Global Stats</b>\n\n"
-            f"Total Deals: {total[0]}\n"
-            f"Closed Deals: {closed_d}\n"
-            f"Open Deals: {open_d}\n"
-            f"Total Volume: ₹{total[1] or 0}\n\n"
-            f"🧭 <b>PW BY:</b> {PW_BY}")
-    update.message.reply_text(text, parse_mode=ParseMode.HTML)
+def adminlist(update, ctx):
+    cur.execute("SELECT user_id FROM admins"); rows = cur.fetchall()
+    if not rows: update.message.reply_text("No admins added."); return
+    text = "\n".join([f"👤 {r[0]}" for r in rows])
+    update.message.reply_text("🧠 Admin List:\n" + text)
 
-@owner_only
-def addadmin(update, context):
-    if not context.args: return update.message.reply_text("Usage: /addadmin <user_id>")
-    uid = int(context.args[0])
-    db_exec("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (uid,))
-    update.message.reply_text(f"✅ Added admin {uid}")
+def addadmin(update, ctx):
+    if not is_owner(update.effective_user.id): return
+    uid = int(ctx.args[0]); cur.execute("INSERT OR IGNORE INTO admins VALUES (?)", (uid,)); conn.commit()
+    update.message.reply_text(f"✅ Added admin: {uid}")
 
-@owner_only
-def removeadmin(update, context):
-    if not context.args: return update.message.reply_text("Usage: /removeadmin <user_id>")
-    uid = int(context.args[0])
-    db_exec("DELETE FROM admins WHERE user_id=?", (uid,))
-    update.message.reply_text(f"🗑 Removed admin {uid}")
+def removeadmin(update, ctx):
+    if not is_owner(update.effective_user.id): return
+    uid = int(ctx.args[0]); cur.execute("DELETE FROM admins WHERE user_id=?", (uid,)); conn.commit()
+    update.message.reply_text(f"🗑️ Removed admin: {uid}")
 
-@owner_only
-def adminlist(update, context):
-    rows = db_exec("SELECT user_id FROM admins", fetch=True)
-    text = "👮 <b>Admin List</b>\n\n" + "\n".join([str(r[0]) for r in rows])
-    update.message.reply_text(text, parse_mode=ParseMode.HTML)
+def topuser(update, ctx):
+    cur.execute("SELECT escrower,COUNT(*) as deals FROM deals GROUP BY escrower ORDER BY deals DESC LIMIT 5")
+    rows = cur.fetchall()
+    if not rows: update.message.reply_text("No users yet."); return
+    text = "\n".join([f"🏆 {r[0]} – {r[1]} deals" for r in rows])
+    update.message.reply_text("⭐ **Top Escrow Users:**\n" + text, parse_mode=ParseMode.MARKDOWN)
 
-# ───── KEEPALIVE ─────
+def command(update, ctx):
+    uid = update.effective_user.id
+    if not is_admin(uid): return
+    text = (
+        "🤖 𝗔𝗱𝗺𝗶𝗻 𝗖𝗼𝗺𝗺𝗮𝗻𝗱𝘀 𝗟𝗶𝘀𝘁\n\n"
+        "💼 Deals:\n"
+        "/add /close /refund /cancel /status /history /ongoing /mydeals\n\n"
+        "📊 Stats:\n"
+        "/stats /stat /gstats /topuser\n\n"
+        "🧠 Admin Tools:\n"
+        "/addadmin /removeadmin /adminlist /broadcast\n\n"
+        "⏰ Utility:\n"
+        "/notify /id /command\n\n"
+        "🧭 PW BY: " + PW_BY
+    )
+    update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+# ===== KEEP ALIVE =====
 def keep_alive():
     while True:
-        try:
-            requests.get("https://choreo.dev")
-        except:
-            pass
+        try: requests.get(KEEP_ALIVE_URL)
+        except: pass
         time.sleep(300)
 
-# ───── MAIN ─────
+threading.Thread(target=keep_alive, daemon=True).start()
+
+# ===== MAIN =====
 def main():
-    init_db()
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("id", id_cmd))
     dp.add_handler(CommandHandler("add", add))
     dp.add_handler(CommandHandler("close", close))
+    dp.add_handler(CommandHandler("refund", refund))
+    dp.add_handler(CommandHandler("cancel", cancel))
+    dp.add_handler(CommandHandler("status", status))
     dp.add_handler(CommandHandler("history", history))
+    dp.add_handler(CommandHandler("ongoing", ongoing))
     dp.add_handler(CommandHandler("broadcast", broadcast))
-    dp.add_handler(CommandHandler("stats", stats))
+    dp.add_handler(CommandHandler("adminlist", adminlist))
     dp.add_handler(CommandHandler("addadmin", addadmin))
     dp.add_handler(CommandHandler("removeadmin", removeadmin))
-    dp.add_handler(CommandHandler("adminlist", adminlist))
+    dp.add_handler(CommandHandler("topuser", topuser))
+    dp.add_handler(CommandHandler("command", command))
 
-    threading.Thread(target=keep_alive, daemon=True).start()
+    logger.info("✅ FinalMM v3.1 started successfully.")
     updater.start_polling()
-    logger.info("✅ FinalMM Bot started successfully")
     updater.idle()
 
 if __name__ == "__main__":
